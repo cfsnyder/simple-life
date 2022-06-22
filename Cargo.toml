@@ -3,10 +3,8 @@ name = "simple-life"
 version = "0.1.2"
 edition = "2021"
 description = "Simple async lifecycle trait and convenient macros"
-license="MIT"
+license = "MIT"
 
 [dependencies]
-async-trait = "0.1.56"
-
-[features]
-tracing = []
+async-trait = "^0"
+tokio = { version = "^1", features = ["sync", "time", "rt", "macros"] }

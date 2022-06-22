@@ -1,59 +1,58 @@
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
-pub type Stop = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output=()> + Send>>>;
+pub type StopFn = Box<dyn Stop>;
+
+#[async_trait]
+pub trait Stop {
+    async fn stop(self);
+}
 
 #[async_trait]
 pub trait Lifecycle {
-    async fn start(self: Arc<Self>) -> Stop;
+    async fn start(self: Arc<Self>) -> Option<StopFn>;
 }
 
-#[macro_export]
-macro_rules! interval_worker {
-    ($name:expr, $interval:expr, $body:expr) => {{
-        if cfg!(feature = "tracing") {
-            tracing::info!("{} starting", $name);
-        }
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let jh = tokio::spawn(async move {
-            let sleep = tokio::time::sleep($interval.to_std().unwrap());
-            tokio::pin!(sleep);
-            loop {
-                tokio::select! {
-                    _ = &mut sleep => {
-                        $body.await;
-                        sleep.as_mut().reset(tokio::time::Instant::now() + $interval.to_std().unwrap());
-                    },
-                    _ = &mut rx => {
-                        return;
-                    }
+#[async_trait]
+impl<F, R> Stop for F
+where
+    F: FnOnce() -> R + Send,
+    R: Future<Output = ()> + Send,
+{
+    async fn stop(self) {
+        self().await
+    }
+}
+
+pub fn interval_worker<S, F, R>(s: Arc<S>, period: Duration, fun: F) -> StopFn
+where
+    S: Send + Sync + 'static,
+    F: Fn(Arc<S>) -> R + Send + Sync + 'static,
+    R: Future<Output = ()> + Send + Sync,
+{
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let jh = tokio::spawn(async move {
+        let sleep = tokio::time::sleep(period);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => {
+                    fun(s.clone()).await;
+                    sleep.as_mut().reset(tokio::time::Instant::now() + period);
+                },
+                _ = &mut rx => {
+                    return;
                 }
             }
-        });
-        Box::new(move || {
-            Box::pin(async move {
-                if cfg!(feature = "tracing") {
-                    tracing::info!("{} stopping", $name);
-                }
-                let _ = tx.send(());
-                tokio::time::timeout(std::time::Duration::from_secs(60), jh)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if cfg!(feature = "tracing") {
-                    tracing::info!("{} stopped", $name);
-                }
-            })
+        }
+    });
+    Box::new(|| {
+        Box::pin(async move {
+            let _ = tx.send(());
+            jh.await.unwrap();
         })
-    }};
-}
-
-#[macro_export]
-macro_rules! no_teardown {
-    () => {
-        Box::new(|| Box::pin(async {}))
-    };
+    })
 }
