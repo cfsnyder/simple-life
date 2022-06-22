@@ -14,7 +14,7 @@ pub trait Lifecycle {
 #[macro_export]
 macro_rules! interval_worker {
     ($name:expr, $interval:expr, $body:expr) => {{
-        if cfg!(tracing) {
+        if cfg!(feature = "tracing") {
             tracing::info!("{} starting", $name);
         }
         let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -35,7 +35,7 @@ macro_rules! interval_worker {
         });
         Box::new(move || {
             Box::pin(async move {
-                if cfg!(tracing) {
+                if cfg!(feature = "tracing") {
                     tracing::info!("{} stopping", $name);
                 }
                 let _ = tx.send(());
@@ -43,7 +43,7 @@ macro_rules! interval_worker {
                     .await
                     .unwrap()
                     .unwrap();
-                if cfg!(tracing) {
+                if cfg!(feature = "tracing") {
                     tracing::info!("{} stopped", $name);
                 }
             })
