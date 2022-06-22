@@ -2,6 +2,8 @@
 name = "simple-life"
 version = "0.1.0"
 edition = "2021"
+description = "Simple async lifecycle trait and convenient macros"
+license="MIT"
 
 [dependencies]
 async-trait = "0.1.56"
