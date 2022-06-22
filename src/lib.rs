@@ -22,7 +22,7 @@ macro_rules! interval_worker {
             let sleep = tokio::time::sleep($interval.to_std().unwrap());
             tokio::pin!(sleep);
             loop {
-                select! {
+                tokio::select! {
                     _ = &mut sleep => {
                         $body.await;
                         sleep.as_mut().reset(tokio::time::Instant::now() + $interval.to_std().unwrap());
