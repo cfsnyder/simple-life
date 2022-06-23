@@ -15,23 +15,55 @@ pub trait Lifecycle: Send + 'static {
     async fn start(self) -> Self::S;
 }
 
-pub fn combine<A, B>(a: A, b: B) -> impl Lifecycle
+pub fn seq<A, B>(a: A, b: B) -> impl Lifecycle
+    where
+        A: Lifecycle,
+        B: Lifecycle,
+{
+    move || {
+        async move {
+            let (a_stop, b_stop) = (a.start().await, b.start().await);
+            move || {
+                async {
+                    b_stop.stop().await;
+                    a_stop.stop().await;
+                }
+            }
+        }
+    }
+}
+
+pub fn parallel<A, B>(a: A, b: B) -> impl Lifecycle
 where
     A: Lifecycle,
     B: Lifecycle,
 {
     move || {
         async move {
-            let a_stop = a.start().await;
-            let b_stop = b.start().await;
+            let (a_stop, b_stop) = tokio::join!(a.start(), b.start());
             move || {
                 async {
-                    a_stop.stop().await;
-                    b_stop.stop().await;
+                    let _ = tokio::join!(a_stop.stop(), b_stop.stop());
                 }
             }
         }
     }
+}
+
+#[macro_export]
+macro_rules! parallel {
+    ($x:expr $(,)?) => ($x);
+    ($x:expr, $($y:expr),+ $(,)?) => (
+        simple_life::parallel($x, simple_life::parallel!($($y),+))
+    )
+}
+
+#[macro_export]
+macro_rules! seq {
+    ($x:expr $(,)?) => ($x);
+    ($x:expr, $($y:expr),+ $(,)?) => (
+        simple_life::seq($x, simple_life::seq!($($y),+))
+    )
 }
 
 #[async_trait]
