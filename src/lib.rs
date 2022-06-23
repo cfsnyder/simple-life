@@ -20,34 +20,26 @@ pub fn seq<A, B>(a: A, b: B) -> impl Lifecycle
         A: Lifecycle,
         B: Lifecycle,
 {
-    move || {
-        async move {
-            let (a_stop, b_stop) = (a.start().await, b.start().await);
-            move || {
-                async {
-                    b_stop.stop().await;
-                    a_stop.stop().await;
-                }
-            }
-        }
-    }
+    lifecycle!(state, {
+        (a.start().await, b.start().await)
+    }, {
+        let (a_stop, b_stop) = state;
+        b_stop.stop().await;
+        a_stop.stop().await;
+    })
 }
 
 pub fn parallel<A, B>(a: A, b: B) -> impl Lifecycle
-where
-    A: Lifecycle,
-    B: Lifecycle,
+    where
+        A: Lifecycle,
+        B: Lifecycle,
 {
-    move || {
-        async move {
-            let (a_stop, b_stop) = tokio::join!(a.start(), b.start());
-            move || {
-                async {
-                    let _ = tokio::join!(a_stop.stop(), b_stop.stop());
-                }
-            }
-        }
-    }
+    lifecycle!(state, {
+        tokio::join!(a.start(), b.start())
+    }, {
+        let (a_stop, b_stop) = state;
+        let _ = tokio::join!(a_stop.stop(), b_stop.stop());
+    })
 }
 
 #[macro_export]
@@ -64,6 +56,39 @@ macro_rules! seq {
     ($x:expr, $($y:expr),+ $(,)?) => (
         simple_life::seq($x, simple_life::seq!($($y),+))
     )
+}
+
+#[macro_export]
+macro_rules! lifecycle {
+    ($state:ident, $start:block, $stop:block) => (
+        move || {
+            async move {
+                let $state = $start;
+                move || {
+                    async move {
+                        $stop
+                    }
+                }
+            }
+        }
+    );
+    ($start:block, $stop:block) => (
+        simple_life::lifecycle!(_state, $start, $stop)
+    );
+}
+
+#[macro_export]
+macro_rules! start {
+    ($x:block) => (
+        simple_life::lifecycle!($x, {})
+    );
+}
+
+#[macro_export]
+macro_rules! stop {
+    ($x:block) => (
+        simple_life::lifecycle!({}, $x)
+    );
 }
 
 #[async_trait]
@@ -97,7 +122,7 @@ pub fn interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
         F: Fn(S) -> R + Send + Sync + 'static,
         R: Future<Output=()> + Send,
 {
-    move || async move {
+    lifecycle!(state, {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let jh = tokio::spawn(async move {
             let sleep = tokio::time::sleep(period);
@@ -114,13 +139,12 @@ pub fn interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
             }
             }
         });
-        move || {
-            async move {
-                let _ = tx.send(());
-                jh.await.unwrap();
-            }
-        }
-    }
+        (tx, jh)
+    }, {
+        let (tx, jh) = state;
+        let _ = tx.send(());
+        jh.await.unwrap();
+    })
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -128,6 +152,5 @@ pub struct NoStop;
 
 #[async_trait]
 impl Stop for NoStop {
-    async fn stop(self) {
-    }
+    async fn stop(self) {}
 }
