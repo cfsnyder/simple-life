@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -116,7 +118,7 @@ impl<F, R> Stop for F
     }
 }
 
-pub fn interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
+pub fn spawn_interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
     where
         S: Clone + 'static + Send + Sync,
         F: Fn(S) -> R + Send + Sync + 'static,
@@ -144,6 +146,37 @@ pub fn interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
         let (tx, jh) = state;
         let _ = tx.send(());
         jh.await.unwrap();
+    })
+}
+
+pub struct ShutdownSignal(tokio::sync::oneshot::Receiver<()>);
+
+impl Future for ShutdownSignal {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx).map(|r| r.unwrap())
+    }
+}
+
+pub fn spawn_with_shutdown<S, F, R>(s: S, fun: F) -> impl Lifecycle
+    where
+        S: 'static + Send,
+        F: FnOnce(S, ShutdownSignal) -> R + Send + Sync + 'static,
+        R: Future<Output=()> + Send,
+{
+    lifecycle!(chans, {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (conf_tx, conf_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+             let _ = fun(s, ShutdownSignal(shutdown_rx)).await;
+             let _ = conf_tx.send(()).unwrap();
+        });
+        (shutdown_tx, conf_rx)
+    }, {
+        let (shutdown_tx, conf_rx) = chans;
+        shutdown_tx.send(()).unwrap();
+        let _ = conf_rx.await.unwrap();
     })
 }
 
