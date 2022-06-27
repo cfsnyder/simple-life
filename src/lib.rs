@@ -124,28 +124,20 @@ pub fn spawn_interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
         F: Fn(S) -> R + Send + Sync + 'static,
         R: Future<Output=()> + Send,
 {
-    lifecycle!(state, {
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let jh = tokio::spawn(async move {
-            let sleep = tokio::time::sleep(period);
-            tokio::pin!(sleep);
-            loop {
-                tokio::select! {
-                _ = &mut sleep => {
-                    fun(s.clone()).await;
-                    sleep.as_mut().reset(tokio::time::Instant::now() + period);
-                },
-                _ = &mut rx => {
-                    return;
+    spawn_with_shutdown(s, move |s, mut sig| async move {
+        let sleep = tokio::time::sleep(period);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                    _ = &mut sleep => {
+                        fun(s.clone()).await;
+                        sleep.as_mut().reset(tokio::time::Instant::now() + period);
+                    },
+                    _ = &mut sig => {
+                        return;
+                    }
                 }
-            }
-            }
-        });
-        (tx, jh)
-    }, {
-        let (tx, jh) = state;
-        let _ = tx.send(());
-        jh.await.unwrap();
+        }
     })
 }
 
@@ -167,16 +159,14 @@ pub fn spawn_with_shutdown<S, F, R>(s: S, fun: F) -> impl Lifecycle
 {
     lifecycle!(chans, {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (conf_tx, conf_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
+        let jh = tokio::spawn(async move {
              let _ = fun(s, ShutdownSignal(shutdown_rx)).await;
-             let _ = conf_tx.send(()).unwrap();
         });
-        (shutdown_tx, conf_rx)
+        (shutdown_tx, jh)
     }, {
-        let (shutdown_tx, conf_rx) = chans;
+        let (shutdown_tx, jh) = chans;
         shutdown_tx.send(()).unwrap();
-        let _ = conf_rx.await.unwrap();
+        let _ = jh.await;
     })
 }
 
