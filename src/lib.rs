@@ -153,7 +153,7 @@ impl Future for ShutdownSignal {
 
 pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle
     where
-        F: FnOnce(ShutdownSignal) -> R + Send + Sync + 'static,
+        F: FnOnce(ShutdownSignal) -> R + Send + 'static,
         R: Future<Output=()> + Send,
 {
     lifecycle!(chans, {
