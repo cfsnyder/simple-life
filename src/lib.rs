@@ -124,7 +124,7 @@ pub fn spawn_interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
         F: Fn(S) -> R + Send + Sync + 'static,
         R: Future<Output=()> + Send,
 {
-    spawn_with_shutdown(s, move |s, mut sig| async move {
+    spawn_with_shutdown(move |mut sig| async move {
         let sleep = tokio::time::sleep(period);
         tokio::pin!(sleep);
         loop {
@@ -151,16 +151,15 @@ impl Future for ShutdownSignal {
     }
 }
 
-pub fn spawn_with_shutdown<S, F, R>(s: S, fun: F) -> impl Lifecycle
+pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle
     where
-        S: 'static + Send,
-        F: FnOnce(S, ShutdownSignal) -> R + Send + Sync + 'static,
+        F: FnOnce(ShutdownSignal) -> R + Send + Sync + 'static,
         R: Future<Output=()> + Send,
 {
     lifecycle!(chans, {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let jh = tokio::spawn(async move {
-             let _ = fun(s, ShutdownSignal(shutdown_rx)).await;
+             let _ = fun(ShutdownSignal(shutdown_rx)).await;
         });
         (shutdown_tx, jh)
     }, {
