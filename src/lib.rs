@@ -6,7 +6,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::error::Elapsed;
+
+pub type BoxedLifecycle = Box<dyn Lifecycle<S = Box<dyn Stop>>>;
 
 #[async_trait]
 pub trait Stop: Send {
@@ -18,6 +21,34 @@ pub trait Lifecycle: Send + 'static {
     type S: Stop;
 
     async fn start(self) -> Self::S;
+
+    fn boxed(self) -> BoxedLifecycle
+    where
+        Self: Sized,
+    {
+        Box::new(move || async move {
+            let stopper = self.start().await;
+            Box::new(move || async move {
+                stopper.stop().await;
+            }) as Box<dyn Stop>
+        })
+    }
+}
+
+#[async_trait]
+impl Lifecycle for BoxedLifecycle {
+    type S = Box<dyn Stop>;
+
+    async fn start(self) -> Self::S {
+        Box::new(self.start().await)
+    }
+}
+
+#[async_trait]
+impl Stop for Box<dyn Stop> {
+    async fn stop(self) {
+        self.stop().await;
+    }
 }
 
 pub fn seq<A, B>(a: A, b: B) -> impl Lifecycle
@@ -181,6 +212,55 @@ async fn std_unix_shutdown_sigs() {
         _ = signal::ctrl_c() => {},
         _ = kill_sig.recv() => {},
     }
+}
+
+#[derive(Clone)]
+pub struct LazyStarter {
+    tx: Sender<Box<dyn Lifecycle<S = Box<dyn Stop>>>>,
+}
+
+impl LazyStarter {
+    fn new() -> (impl Lifecycle, LazyStarter) {
+        let (tx, rx) = tokio::sync::mpsc::channel(5);
+        (LazyStarter::lifecycle(rx), LazyStarter { tx })
+    }
+
+    fn lifecycle(mut rx: Receiver<BoxedLifecycle>) -> impl Lifecycle {
+        spawn_with_shutdown(|sig| async move {
+            let mut stoppers = vec![];
+            tokio::pin!(sig);
+            loop {
+                tokio::select! {
+                    _ = &mut sig => {
+                        break;
+                    },
+                    lc = rx.recv() => {
+                        if let Some(lc) = lc {
+                            stoppers.push(lc.start().await);
+                        } else {
+                            break;
+                        }
+                    },
+                }
+            }
+            let _ = sig.await;
+            if let Some(fut) = stoppers.into_iter().map(Stop::stop).reduce(|a, b| {
+                Box::pin(async {
+                    tokio::join!(a, b);
+                })
+            }) {
+                fut.await;
+            }
+        })
+    }
+
+    pub async fn start(&self, life: impl Lifecycle) {
+        let _ = self.tx.send(life.boxed()).await;
+    }
+}
+
+pub fn lazy_start() -> (impl Lifecycle, LazyStarter) {
+    LazyStarter::new()
 }
 
 #[derive(Eq, PartialEq, Debug)]
