@@ -92,6 +92,12 @@ macro_rules! seq {
 
 #[macro_export]
 macro_rules! lifecycle {
+    (mut $state:ident, $start:block, $stop:block) => {
+        move || async move {
+            let mut $state = $start;
+            move || async move { $stop }
+        }
+    };
     ($state:ident, $start:block, $stop:block) => {
         move || async move {
             let $state = $start;
