@@ -9,11 +9,19 @@ use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::error::Elapsed;
 
-pub type BoxedLifecycle = Box<dyn Lifecycle<S = Box<dyn Stop>>>;
+pub type BoxedStop = Box<dyn Stop>;
+pub type BoxedLifecycle = Box<dyn Lifecycle<S = BoxedStop>>;
 
 #[async_trait]
 pub trait Stop: Send {
     async fn stop(self);
+
+    fn boxed(self) -> BoxedStop
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
 }
 
 #[async_trait]
@@ -26,12 +34,7 @@ pub trait Lifecycle: Send + 'static {
     where
         Self: Sized,
     {
-        Box::new(move || async move {
-            let stopper = self.start().await;
-            Box::new(move || async move {
-                stopper.stop().await;
-            }) as Box<dyn Stop>
-        })
+        Box::new(move || async move { self.start().await.boxed() })
     }
 }
 
@@ -45,7 +48,7 @@ impl Lifecycle for BoxedLifecycle {
 }
 
 #[async_trait]
-impl Stop for Box<dyn Stop> {
+impl Stop for BoxedStop {
     async fn stop(self) {
         self.stop().await;
     }
