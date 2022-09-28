@@ -7,20 +7,18 @@ use async_trait::async_trait;
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::time::error::Elapsed;
-
-pub type BoxedStop = Box<dyn Stop>;
-pub type BoxedLifecycle = Box<dyn Lifecycle<S = BoxedStop>>;
 
 #[async_trait]
 pub trait Stop: Send {
     async fn stop(self);
 
-    fn boxed(self) -> BoxedStop
+    async fn concrete(self) -> ConcreteStop
     where
         Self: Sized + 'static,
     {
-        Box::new(self)
+        ConcreteStop::new(self).await
     }
 }
 
@@ -30,27 +28,80 @@ pub trait Lifecycle: Send + 'static {
 
     async fn start(self) -> Self::S;
 
-    fn boxed(self) -> BoxedLifecycle
+    async fn concrete(self) -> ConcreteLifecycle
     where
         Self: Sized,
     {
-        Box::new(move || async move { self.start().await.boxed() })
+        ConcreteLifecycle::new(self).await
+    }
+}
+
+pub struct ConcreteLifecycle {
+    tx: oneshot::Sender<oneshot::Sender<ConcreteStop>>,
+}
+
+impl ConcreteLifecycle {
+    async fn new(lc: impl Lifecycle) -> Self {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<ConcreteStop>>();
+        tokio::spawn(async move {
+            if let Ok(stop_tx) = rx.await {
+                let stop = lc.start().await;
+                let _ = stop_tx.send(ConcreteStop::new(stop).await);
+            }
+        });
+        ConcreteLifecycle { tx }
+    }
+}
+
+pub async fn parallel_vec(vec: Vec<ConcreteLifecycle>) -> ConcreteLifecycle {
+    let mut lc = None;
+    for next in vec {
+        if let Some(old_lc) = lc {
+            lc = Some(parallel(old_lc, next).concrete().await);
+        } else {
+            lc = Some(next);
+        }
+    }
+    if let Some(lc) = lc {
+        lc
+    } else {
+        NoLife.concrete().await
+    }
+}
+
+pub struct ConcreteStop {
+    tx: oneshot::Sender<oneshot::Sender<()>>,
+}
+
+impl ConcreteStop {
+    async fn new(stop: impl Stop + 'static) -> ConcreteStop {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(async move {
+            if let Ok(done_tx) = rx.await {
+                stop.stop().await;
+                let _ = done_tx.send(());
+            }
+        });
+        ConcreteStop { tx }
     }
 }
 
 #[async_trait]
-impl Lifecycle for BoxedLifecycle {
-    type S = Box<dyn Stop>;
-
+impl Lifecycle for ConcreteLifecycle {
+    type S = ConcreteStop;
     async fn start(self) -> Self::S {
-        Box::new(self.start().await)
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(tx);
+        rx.await.unwrap()
     }
 }
 
 #[async_trait]
-impl Stop for BoxedStop {
+impl Stop for ConcreteStop {
     async fn stop(self) {
-        self.stop().await;
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(tx);
+        rx.await.unwrap();
     }
 }
 
@@ -225,7 +276,7 @@ async fn std_unix_shutdown_sigs() {
 
 #[derive(Clone)]
 pub struct LazyStarter {
-    tx: Sender<Box<dyn Lifecycle<S = Box<dyn Stop>>>>,
+    tx: Sender<ConcreteLifecycle>,
 }
 
 impl LazyStarter {
@@ -234,7 +285,7 @@ impl LazyStarter {
         (LazyStarter::lifecycle(rx), LazyStarter { tx })
     }
 
-    fn lifecycle(mut rx: Receiver<BoxedLifecycle>) -> impl Lifecycle {
+    fn lifecycle(mut rx: Receiver<ConcreteLifecycle>) -> impl Lifecycle {
         spawn_with_shutdown(|sig| async move {
             let mut stoppers = vec![];
             tokio::pin!(sig);
@@ -264,7 +315,7 @@ impl LazyStarter {
     }
 
     pub async fn start(&self, life: impl Lifecycle) {
-        let _ = self.tx.send(life.boxed()).await;
+        let _ = self.tx.send(life.concrete().await).await;
     }
 }
 
@@ -278,4 +329,15 @@ pub struct NoStop;
 #[async_trait]
 impl Stop for NoStop {
     async fn stop(self) {}
+}
+
+pub struct NoLife;
+
+#[async_trait]
+impl Lifecycle for NoLife {
+    type S = NoStop;
+
+    async fn start(self) -> Self::S {
+        NoStop
+    }
 }
