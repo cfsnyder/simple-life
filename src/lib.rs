@@ -7,20 +7,26 @@ use async_trait::async_trait;
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
-
-pub type BoxedStop = Box<dyn Stop>;
-pub type BoxedLifecycle = Box<dyn Lifecycle<S = BoxedStop>>;
 
 #[async_trait]
 pub trait Stop: Send {
     async fn stop(self);
 
-    fn boxed(self) -> BoxedStop
+    async fn concrete(self) -> ConcreteStop
     where
         Self: Sized + 'static,
     {
-        Box::new(self)
+        ConcreteStop::new(self).await
+    }
+
+    async fn into_guard(self) -> StopGuard
+    where
+        Self: Sized + 'static,
+    {
+        StopGuard::new(self).await
     }
 }
 
@@ -30,27 +36,120 @@ pub trait Lifecycle: Send + 'static {
 
     async fn start(self) -> Self::S;
 
-    fn boxed(self) -> BoxedLifecycle
+    async fn concrete(self) -> ConcreteLifecycle
     where
         Self: Sized,
     {
-        Box::new(move || async move { self.start().await.boxed() })
+        ConcreteLifecycle::new(self).await
+    }
+}
+
+pub struct StopGuard {
+    _tx: oneshot::Sender<()>,
+}
+
+impl StopGuard {
+    async fn new(stop: impl Stop + 'static) -> Self {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = rx.await;
+            let _ = stop.stop().await;
+        });
+        StopGuard { _tx: tx }
+    }
+}
+
+pub struct IntrospectableStop {
+    sig: oneshot::Sender<()>,
+    jh: JoinHandle<()>,
+}
+
+impl IntrospectableStop {
+    fn new(jh: JoinHandle<()>, sig: oneshot::Sender<()>) -> Self {
+        IntrospectableStop { jh, sig }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.jh.is_finished()
     }
 }
 
 #[async_trait]
-impl Lifecycle for BoxedLifecycle {
-    type S = Box<dyn Stop>;
-
-    async fn start(self) -> Self::S {
-        Box::new(self.start().await)
-    }
-}
-
-#[async_trait]
-impl Stop for BoxedStop {
+impl Stop for IntrospectableStop {
     async fn stop(self) {
-        self.stop().await;
+        let _ = self.sig.send(());
+        let _ = self.jh.await;
+    }
+}
+
+pub struct ConcreteLifecycle {
+    tx: oneshot::Sender<oneshot::Sender<ConcreteStop>>,
+}
+
+impl ConcreteLifecycle {
+    async fn new(lc: impl Lifecycle) -> Self {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<ConcreteStop>>();
+        tokio::spawn(async move {
+            if let Ok(stop_tx) = rx.await {
+                let stop = lc.start().await;
+                let _ = stop_tx.send(ConcreteStop::new(stop).await);
+            }
+        });
+        ConcreteLifecycle { tx }
+    }
+}
+
+pub async fn parallel_iter<I: IntoIterator<Item = ConcreteLifecycle>>(
+    iter: I,
+) -> ConcreteLifecycle {
+    let mut lc = None;
+    for next in iter.into_iter() {
+        if let Some(old_lc) = lc {
+            lc = Some(parallel(old_lc, next).concrete().await);
+        } else {
+            lc = Some(next);
+        }
+    }
+    if let Some(lc) = lc {
+        lc
+    } else {
+        NoLife.concrete().await
+    }
+}
+
+pub struct ConcreteStop {
+    tx: oneshot::Sender<oneshot::Sender<()>>,
+}
+
+impl ConcreteStop {
+    async fn new(stop: impl Stop + 'static) -> ConcreteStop {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(async move {
+            if let Ok(done_tx) = rx.await {
+                stop.stop().await;
+                let _ = done_tx.send(());
+            }
+        });
+        ConcreteStop { tx }
+    }
+}
+
+#[async_trait]
+impl Lifecycle for ConcreteLifecycle {
+    type S = ConcreteStop;
+    async fn start(self) -> Self::S {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(tx);
+        rx.await.unwrap()
+    }
+}
+
+#[async_trait]
+impl Stop for ConcreteStop {
+    async fn stop(self) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(tx);
+        rx.await.unwrap();
     }
 }
 
@@ -151,7 +250,11 @@ where
     }
 }
 
-pub fn spawn_interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
+pub fn spawn_interval<S, F, R>(
+    s: S,
+    period: Duration,
+    fun: F,
+) -> impl Lifecycle<S = IntrospectableStop>
 where
     S: Clone + 'static + Send + Sync,
     F: Fn(S) -> R + Send + Sync + 'static,
@@ -180,30 +283,22 @@ impl Future for ShutdownSignal {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map(|r| r.unwrap())
+        Pin::new(&mut self.0).poll(cx).map(|_r| ())
     }
 }
 
-pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle
+pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle<S = IntrospectableStop>
 where
     F: FnOnce(ShutdownSignal) -> R + Send + 'static,
     R: Future<Output = ()> + Send,
 {
-    lifecycle!(
-        chans,
-        {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let jh = tokio::spawn(async move {
-                let _ = fun(ShutdownSignal(shutdown_rx)).await;
-            });
-            (shutdown_tx, jh)
-        },
-        {
-            let (shutdown_tx, jh) = chans;
-            shutdown_tx.send(()).unwrap();
-            let _ = jh.await;
-        }
-    )
+    move || async move {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let jh = tokio::spawn(async move {
+            let _ = fun(ShutdownSignal(shutdown_rx)).await;
+        });
+        IntrospectableStop::new(jh, shutdown_tx)
+    }
 }
 
 pub async fn run_until_shutdown_sig(
@@ -225,16 +320,16 @@ async fn std_unix_shutdown_sigs() {
 
 #[derive(Clone)]
 pub struct LazyStarter {
-    tx: Sender<Box<dyn Lifecycle<S = Box<dyn Stop>>>>,
+    tx: Sender<ConcreteLifecycle>,
 }
 
 impl LazyStarter {
-    fn new() -> (impl Lifecycle, LazyStarter) {
+    fn new() -> (impl Lifecycle<S = IntrospectableStop>, LazyStarter) {
         let (tx, rx) = tokio::sync::mpsc::channel(5);
         (LazyStarter::lifecycle(rx), LazyStarter { tx })
     }
 
-    fn lifecycle(mut rx: Receiver<BoxedLifecycle>) -> impl Lifecycle {
+    fn lifecycle(mut rx: Receiver<ConcreteLifecycle>) -> impl Lifecycle<S = IntrospectableStop> {
         spawn_with_shutdown(|sig| async move {
             let mut stoppers = vec![];
             tokio::pin!(sig);
@@ -247,12 +342,12 @@ impl LazyStarter {
                         if let Some(lc) = lc {
                             stoppers.push(lc.start().await);
                         } else {
+                            let _ = sig.await;
                             break;
                         }
                     },
                 }
             }
-            let _ = sig.await;
             if let Some(fut) = stoppers.into_iter().map(Stop::stop).reduce(|a, b| {
                 Box::pin(async {
                     tokio::join!(a, b);
@@ -264,7 +359,7 @@ impl LazyStarter {
     }
 
     pub async fn start(&self, life: impl Lifecycle) {
-        let _ = self.tx.send(life.boxed()).await;
+        let _ = self.tx.send(life.concrete().await).await;
     }
 }
 
@@ -278,4 +373,15 @@ pub struct NoStop;
 #[async_trait]
 impl Stop for NoStop {
     async fn stop(self) {}
+}
+
+pub struct NoLife;
+
+#[async_trait]
+impl Lifecycle for NoLife {
+    type S = NoStop;
+
+    async fn start(self) -> Self::S {
+        NoStop
+    }
 }
