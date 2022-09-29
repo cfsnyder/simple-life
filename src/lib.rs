@@ -8,6 +8,7 @@ use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 
 #[async_trait]
@@ -19,6 +20,13 @@ pub trait Stop: Send {
         Self: Sized + 'static,
     {
         ConcreteStop::new(self).await
+    }
+
+    async fn into_guard(self) -> StopGuard
+    where
+        Self: Sized + 'static,
+    {
+        StopGuard::new(self).await
     }
 }
 
@@ -33,6 +41,44 @@ pub trait Lifecycle: Send + 'static {
         Self: Sized,
     {
         ConcreteLifecycle::new(self).await
+    }
+}
+
+pub struct StopGuard {
+    _tx: oneshot::Sender<()>,
+}
+
+impl StopGuard {
+    async fn new(stop: impl Stop + 'static) -> Self {
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = rx.await;
+            let _ = stop.stop().await;
+        });
+        StopGuard { _tx: tx }
+    }
+}
+
+pub struct IntrospectableStop {
+    sig: oneshot::Sender<()>,
+    jh: JoinHandle<()>,
+}
+
+impl IntrospectableStop {
+    fn new(jh: JoinHandle<()>, sig: oneshot::Sender<()>) -> Self {
+        IntrospectableStop { jh, sig }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.jh.is_finished()
+    }
+}
+
+#[async_trait]
+impl Stop for IntrospectableStop {
+    async fn stop(self) {
+        let _ = self.sig.send(());
+        let _ = self.jh.await;
     }
 }
 
@@ -53,9 +99,11 @@ impl ConcreteLifecycle {
     }
 }
 
-pub async fn parallel_vec(vec: Vec<ConcreteLifecycle>) -> ConcreteLifecycle {
+pub async fn parallel_iter<I: IntoIterator<Item = ConcreteLifecycle>>(
+    iter: I,
+) -> ConcreteLifecycle {
     let mut lc = None;
-    for next in vec {
+    for next in iter.into_iter() {
         if let Some(old_lc) = lc {
             lc = Some(parallel(old_lc, next).concrete().await);
         } else {
@@ -202,7 +250,11 @@ where
     }
 }
 
-pub fn spawn_interval<S, F, R>(s: S, period: Duration, fun: F) -> impl Lifecycle
+pub fn spawn_interval<S, F, R>(
+    s: S,
+    period: Duration,
+    fun: F,
+) -> impl Lifecycle<S = IntrospectableStop>
 where
     S: Clone + 'static + Send + Sync,
     F: Fn(S) -> R + Send + Sync + 'static,
@@ -235,26 +287,18 @@ impl Future for ShutdownSignal {
     }
 }
 
-pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle
+pub fn spawn_with_shutdown<F, R>(fun: F) -> impl Lifecycle<S = IntrospectableStop>
 where
     F: FnOnce(ShutdownSignal) -> R + Send + 'static,
     R: Future<Output = ()> + Send,
 {
-    lifecycle!(
-        chans,
-        {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let jh = tokio::spawn(async move {
-                let _ = fun(ShutdownSignal(shutdown_rx)).await;
-            });
-            (shutdown_tx, jh)
-        },
-        {
-            let (shutdown_tx, jh) = chans;
-            shutdown_tx.send(()).unwrap();
-            let _ = jh.await;
-        }
-    )
+    move || async move {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let jh = tokio::spawn(async move {
+            let _ = fun(ShutdownSignal(shutdown_rx)).await;
+        });
+        IntrospectableStop::new(jh, shutdown_tx)
+    }
 }
 
 pub async fn run_until_shutdown_sig(
