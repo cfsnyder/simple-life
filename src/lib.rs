@@ -296,6 +296,26 @@ where
     })
 }
 
+pub fn spawn_lifecycle_with_delay(
+    delay: Duration,
+    lc: impl Lifecycle,
+) -> impl Lifecycle<S = IntrospectableStop> {
+    spawn_with_shutdown(move |mut sig| async move {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => {
+                let stopper = lc.start().await;
+                sig.await;
+                stopper.stop().await;
+            },
+            _ = &mut sig => {
+                return;
+            }
+        }
+    })
+}
+
 pub struct ShutdownSignal(tokio::sync::oneshot::Receiver<()>);
 
 impl Future for ShutdownSignal {
