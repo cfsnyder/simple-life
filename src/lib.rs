@@ -277,6 +277,25 @@ where
     })
 }
 
+pub fn spawn_with_delay<F, R>(delay: Duration, fun: F) -> impl Lifecycle<S = IntrospectableStop>
+where
+    F: Fn() -> R + Send + Sync + 'static,
+    R: Future<Output = ()> + Send,
+{
+    spawn_with_shutdown(move |mut sig| async move {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => {
+                fun().await;
+            },
+            _ = &mut sig => {
+                return;
+            }
+        }
+    })
+}
+
 pub struct ShutdownSignal(tokio::sync::oneshot::Receiver<()>);
 
 impl Future for ShutdownSignal {
